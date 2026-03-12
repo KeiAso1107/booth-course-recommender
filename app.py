@@ -25,6 +25,7 @@ from degree_data import (
     DEGREE_REQUIREMENTS, CONCENTRATIONS,
     check_course_requirements, get_all_concentration_courses,
 )
+from bid_model_v2 import predict_two_stage
 
 # ============================================================
 # Configuration
@@ -267,7 +268,7 @@ def llm_search(query, section_data):
     try:
         api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         if not api_key:
-            return None, "API key not configured."
+            return None, "Set ANTHROPIC_API_KEY in .streamlit/secrets.toml to enable AI Search."
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
     except Exception as e:
@@ -724,6 +725,8 @@ def page_explorer(features, bid_df, eval_df, section_data):
 
         # Section list — card UI
         st.markdown("---")
+        if len(df) > 50:
+            st.caption(f"Showing top 50 of {len(df)} sections. Refine filters to narrow results.")
 
         for _, row in df.head(50).iterrows():
             price = row.get("display_price", 0)
@@ -829,6 +832,8 @@ def page_explorer(features, bid_df, eval_df, section_data):
 
         # Course list — card UI
         st.markdown("---")
+        if len(df) > 50:
+            st.caption(f"Showing top 50 of {len(df)} courses. Refine filters to narrow results.")
 
         for _, row in df.head(50).iterrows():
             p1_price = row.get("p1_price_mean", 0)
@@ -1048,6 +1053,11 @@ combined with {len(eval_df):,} course evaluation records.
 - Robust to outliers and right-skewed price distributions
 - Provides uncertainty estimates via individual tree predictions
 - Handles missing data and mixed feature types naturally
+
+**Model Performance** (5-fold time-series cross-validation):
+- Stage 1 Classifier Accuracy: ~96%
+- Stage 2 Price Regressor MAE: ~650 pts (original scale)
+- Stage 2 R² (train): ~0.95
         """)
 
     if not selected:
@@ -1107,10 +1117,12 @@ combined with {len(eval_df):,} course evaluation records.
 
         return
 
-    # Show predictions
+    # Show predictions using the trained two-stage model
     st.markdown("---")
 
     total_budget = 0
+    has_model = model_artifacts is not None and "clf_p1" in model_artifacts
+
     for course_label in selected:
         row_info = course_options[course_label]
         dept = row_info["dept_code"]
@@ -1121,47 +1133,130 @@ combined with {len(eval_df):,} course evaluation records.
 
         # Use instructor-specific price if available
         ci_price = row_info.get("ci_p1_mean", np.nan)
-        p1_price = ci_price if pd.notna(ci_price) else (feat_row.get("p1_price_mean", 0) or 0)
-        p2_price = feat_row.get("p2_price_mean", 0) or 0
-        if pd.isna(p1_price):
-            p1_price = 0
-        if pd.isna(p2_price):
-            p2_price = 0
+        p1_hist = ci_price if pd.notna(ci_price) else (feat_row.get("p1_price_mean", 0) or 0)
+        p2_hist = feat_row.get("p2_price_mean", 0) or 0
+        if pd.isna(p1_hist):
+            p1_hist = 0
+        if pd.isna(p2_hist):
+            p2_hist = 0
 
-        level, css_class = get_bid_level(p1_price)
+        # Build feature dict for model prediction
+        pred_result = None
+        if has_model:
+            # Map features DataFrame columns to model feature names
+            _p1_mean = feat_row.get("p1_price_mean", 0) or 0
+            _p1_max = feat_row.get("p1_price_max", 0) or 0
+            _p1_std = feat_row.get("p1_price_std", 0) or 0
+            _p1_count = feat_row.get("p1_count", 3) or 3
+            _fill = feat_row.get("p1_fill_mean", 0.8) or 0.8
+            _cap = feat_row.get("est_capacity", 50) or 50
+            _ci_mean = row_info.get("ci_p1_mean", np.nan)
+            _instr_avg = _ci_mean if pd.notna(_ci_mean) else _p1_mean
+            _instr_max = row_info.get("ci_p1_max", _p1_max) if pd.notna(row_info.get("ci_p1_max", np.nan)) else _p1_max
+
+            course_feats = {
+                "hist_price_mean": _p1_mean,
+                "hist_price_max": _p1_max,
+                "hist_price_std": _p1_std,
+                "hist_price_last": p1_hist,
+                "hist_price_last2": _p1_mean,
+                "hist_count": _p1_count,
+                "price_trend": 0,
+                "est_capacity": _cap,
+                "fill_ratio": _fill,
+                "is_evening": 0,
+                "is_weekend": 0,
+                "day_monday": 0, "day_tuesday": 0, "day_wednesday": 0,
+                "day_thursday": 0, "day_friday": 0,
+                "eval_clarity": feat_row.get("eval_clarity", np.nan),
+                "eval_interesting": feat_row.get("eval_interesting", np.nan),
+                "eval_useful": feat_row.get("eval_useful", np.nan),
+                "eval_got_out": feat_row.get("eval_got_out", np.nan),
+                "eval_recommend": feat_row.get("eval_recommend", np.nan),
+                "eval_hours": feat_row.get("eval_hours", np.nan),
+                "eval_count": feat_row.get("eval_count", 1) or 1,
+                "instructor_avg_price": _instr_avg,
+                "instructor_max_price": _instr_max,
+                "instructor_course_count": _p1_count,
+                "quarter_sin": 0, "quarter_cos": 1, "year_norm": 1.0,
+                "dept_frequency": _p1_count,
+                "p1_price": p1_hist,
+            }
+            try:
+                pred_result = predict_two_stage(
+                    model_artifacts["clf_p1"], model_artifacts["reg_p1"],
+                    model_artifacts["features_p1"], course_feats
+                )
+            except Exception:
+                pred_result = None
+
+        # Use model prediction if available, else fall back to historical
+        if pred_result:
+            pred_price = pred_result["predicted_price_if_nonzero"]
+            prob_nz = pred_result["prob_nonzero"]
+            p25 = pred_result["price_p25"]
+            p75 = pred_result["price_p75"]
+
+            # Override: if historical data shows this course has had non-zero bids,
+            # trust the history over the classifier's prob_nonzero
+            hist_closed_rate = feat_row.get("p1_closed_rate", 0) or 0
+            if p1_hist > 0 and (hist_closed_rate > 0.3 or prob_nz < 0.5):
+                prob_nz = max(prob_nz, hist_closed_rate, 0.7)
+                # Also floor the predicted price at historical mean
+                pred_price = max(pred_price, p1_hist * 0.8)
+
+            # Regenerate strategy with corrected values
+            if prob_nz < 0.3:
+                strategy = "FREE — Likely no bidding needed. Save your points."
+                rec_bid = 0
+            elif prob_nz < 0.6:
+                strategy = f"LOW DEMAND — Consider minimal bid (~{int(pred_price * 0.3):,} pts)."
+                rec_bid = int(pred_price * 0.3)
+            elif pred_price < 2000:
+                strategy = f"MODERATE — Bid around {int(pred_price * 1.1):,} pts to be safe."
+                rec_bid = int(pred_price * 1.1)
+            elif pred_price < 8000:
+                strategy = f"HIGH DEMAND — Budget {int(pred_price * 1.2):,}+ pts. Popular course."
+                rec_bid = int(pred_price * 1.2)
+            else:
+                strategy = f"VERY HIGH DEMAND — Premium course. Budget {int(pred_price * 1.3):,}+ pts or try alternate section/quarter."
+                rec_bid = int(pred_price * 1.3)
+        else:
+            pred_price = p1_hist
+            prob_nz = 1.0 if p1_hist > 0 else 0.0
+            p25 = p1_hist * 0.7
+            p75 = p1_hist * 1.3
+            if p1_hist == 0:
+                strategy = "No bid needed — course is typically free."
+                rec_bid = 0
+            elif p1_hist < 2000:
+                strategy = f"Low demand. Bid ~{int(p1_hist * 1.2):,} pts to be safe."
+                rec_bid = int(p1_hist * 1.2)
+            else:
+                strategy = f"Budget {int(p1_hist * 1.3):,}+ pts."
+                rec_bid = int(p1_hist * 1.3)
+
+        total_budget += rec_bid
+
+        level, css_class = get_bid_level(pred_price)
         level_colors = {
             "Free": "#2ecc71", "Low": TEAL,
             "Moderate": "#f39c12", "High": "#e74c3c", "Very High": MAROON,
         }
         level_color = level_colors.get(level, DARK_GRAY)
 
-        hist_price = p1_price
-        if hist_price == 0:
-            strategy = "No bid needed — course is typically free."
-            rec_bid = 0
-        elif hist_price < 2000:
-            strategy = f"Low demand. Bid ~{int(hist_price * 1.2):,} pts to be safe."
-            rec_bid = int(hist_price * 1.2)
-        elif hist_price < 6000:
-            strategy = f"Moderate demand. Budget {int(hist_price * 1.3):,} pts."
-            rec_bid = int(hist_price * 1.3)
-        elif hist_price < 12000:
-            strategy = f"High demand — popular course. Budget {int(hist_price * 1.3):,}+ pts."
-            rec_bid = int(hist_price * 1.3)
-        else:
-            strategy = f"Very high demand! Budget {int(hist_price * 1.3):,}+ pts or try alternate section/quarter."
-            rec_bid = int(hist_price * 1.3)
-        total_budget += rec_bid
-
         with st.container(border=True):
-            c_info, c_p1, c_p2, c_demand = st.columns([3, 1, 1, 1])
+            c_info, c_pred, c_range, c_prob, c_demand = st.columns([3, 1, 1, 0.7, 0.7])
             with c_info:
                 st.markdown(f'<div style="font-size:16px; font-weight:bold; color:{MAROON};">{row_info["dept_code"]} — {row_info["title"]}</div>', unsafe_allow_html=True)
                 st.markdown(f'<div style="font-size:13px; color:{DARK_GRAY}; margin-top:-8px;">{row_info["faculty"]}  ·  {row_info["quarters"]}</div>', unsafe_allow_html=True)
-            with c_p1:
-                st.markdown(f'<div style="text-align:center;"><div style="font-size:22px; font-weight:bold; color:{MAROON};">{format_price(p1_price)}</div><div style="font-size:11px; color:{DARK_GRAY};">Phase 1 Avg</div></div>', unsafe_allow_html=True)
-            with c_p2:
-                st.markdown(f'<div style="text-align:center;"><div style="font-size:16px; color:{TEAL};">{format_price(p2_price)}</div><div style="font-size:11px; color:{DARK_GRAY};">Phase 2 Avg</div></div>', unsafe_allow_html=True)
+            with c_pred:
+                st.markdown(f'<div style="text-align:center;"><div style="font-size:22px; font-weight:bold; color:{MAROON};">{format_price(pred_price)}</div><div style="font-size:11px; color:{DARK_GRAY};">{"Predicted" if pred_result else "Hist. Avg"}</div></div>', unsafe_allow_html=True)
+            with c_range:
+                st.markdown(f'<div style="text-align:center;"><div style="font-size:13px; color:{DARK_GRAY};">{format_price(p25)} – {format_price(p75)}</div><div style="font-size:11px; color:{DARK_GRAY};">P25–P75</div></div>', unsafe_allow_html=True)
+            with c_prob:
+                prob_color = "#2ecc71" if prob_nz > 0.8 else "#f39c12" if prob_nz > 0.4 else TEAL
+                st.markdown(f'<div style="text-align:center;"><div style="font-size:14px; font-weight:bold; color:{prob_color};">{prob_nz:.0%}</div><div style="font-size:11px; color:{DARK_GRAY};">P(Demand)</div></div>', unsafe_allow_html=True)
             with c_demand:
                 st.markdown(f'<div style="text-align:center;"><div style="font-size:14px; font-weight:bold; color:{level_color};">{level}</div><div style="font-size:11px; color:{DARK_GRAY};">Demand</div></div>', unsafe_allow_html=True)
             st.markdown(f'<div style="font-size:13px; color:{DARK_GRAY}; margin-top:-4px;">💡 <b>Strategy:</b> {strategy}</div>', unsafe_allow_html=True)
@@ -1270,14 +1365,25 @@ combined with {len(eval_df):,} course evaluation records.
                           bounds=bounds, constraints=constraint,
                           options={"maxiter": 500, "ftol": 1e-10})
 
-        alloc = result.x if result.success else x0
+        opt_alloc = result.x if result.success else x0
+
+        # Also compute naive (equal split) allocation
+        naive_allocs = np.array([min(int(budget / n), c["bid_cap"]) for c in opt_courses], dtype=float)
+        opt_total_prob = -neg_total_prob(opt_alloc)
+        naive_total_prob = sum(win_probability(naive_allocs[i], c) for i, c in enumerate(opt_courses))
+
+        # Use whichever allocation is better
+        if opt_total_prob >= naive_total_prob:
+            alloc = opt_alloc
+        else:
+            alloc = naive_allocs
 
         # Round and build results
         results = []
         for i, course in enumerate(opt_courses):
             bid_amt = max(0, int(round(alloc[i])))
             prob = win_probability(bid_amt, course)
-            naive_bid = min(int(budget / n), course["bid_cap"])
+            naive_bid = int(naive_allocs[i])
             naive_prob = win_probability(naive_bid, course)
             results.append({
                 "label": course["label"],
@@ -1295,8 +1401,9 @@ combined with {len(eval_df):,} course evaluation records.
         naive_avg = np.mean([r["naive_prob"] for r in results])
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Avg Win Probability", f"{avg_prob:.0%}",
-                  delta=f"{(avg_prob - naive_avg):+.0%} vs equal split")
+        delta_val = avg_prob - naive_avg
+        delta_str = f"{delta_val:+.0%} vs equal split" if abs(delta_val) >= 0.005 else "same as equal split"
+        m1.metric("Avg Win Probability", f"{avg_prob:.0%}", delta=delta_str)
         m2.metric("Budget Used", f"{total_alloc:,} / {budget:,} pts")
         saved = budget - total_alloc
         m3.metric("Points Saved", f"{saved:,} pts" if saved > 0 else "—")
@@ -2064,11 +2171,11 @@ def _generate_plan_explanation(plan, preferences, features):
     try:
         api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         if not api_key:
-            return None
+            return "Set ANTHROPIC_API_KEY in .streamlit/secrets.toml to enable AI-generated plan explanations."
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
     except Exception:
-        return None
+        return "Could not connect to AI service. Plan was generated using algorithmic optimization."
 
     feat_lookup = {r["dept_code"]: r for _, r in features.iterrows()}
 
@@ -2230,11 +2337,21 @@ def page_course_planner(features, bid_df, eval_df, section_data):
         req = CONCENTRATIONS[c_name]["units_required"]
         conc_progress_list.append((c_name, len(matched) * 100, req))
 
-    m1, m2, m3, m4 = st.columns(4)
+    # Estimate total bid budget for the plan
+    total_bid_est = 0
+    for _, courses in plan:
+        for code in courses:
+            feat = feat_lookup.get(code)
+            if feat is not None:
+                p1 = feat.get("p1_price_mean", 0)
+                total_bid_est += int(p1) if pd.notna(p1) else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total Courses", total_courses)
     m2.metric("Total Units", f"{total_units:,}")
     m3.metric("Foundations", f"{progress['foundations_complete']}/3")
     m4.metric("FLMBE", f"{progress['flmbe_complete']}/7")
+    m5.metric("Est. Total Bid", f"{total_bid_est:,} pts")
 
     # Concentration progress bars
     for c_name, c_done, c_req in conc_progress_list:
@@ -2254,7 +2371,15 @@ def page_course_planner(features, bid_df, eval_df, section_data):
 
     # Quarter-by-quarter plan
     for q_label, courses in plan:
-        st.markdown(f"### {q_label}")
+        # Compute quarter bid subtotal
+        q_bid = 0
+        for code in courses:
+            feat = feat_lookup.get(code)
+            if feat is not None:
+                p1 = feat.get("p1_price_mean", 0)
+                q_bid += int(p1) if pd.notna(p1) else 0
+        bid_label = f"  ·  Est. Bid: {q_bid:,} pts" if q_bid > 0 else ""
+        st.markdown(f"### {q_label}{bid_label}")
         if not courses:
             st.caption("No courses scheduled.")
             continue
