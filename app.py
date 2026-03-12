@@ -319,9 +319,9 @@ Respond with ONLY valid JSON. No explanation. Examples:
 
     # Apply filters to section_data
     df = section_data.copy()
-    df["display_price"] = df["ci_p1_mean"].fillna(df["p1_price_mean"])
-    df["display_rating"] = df["instr_rating"].fillna(df["eval_overall"])
-    df["display_hours"] = df["instr_hours"].fillna(df["eval_hours"])
+    df["display_price"] = pd.to_numeric(df["ci_p1_mean"].where(df["ci_p1_mean"].notna(), df["p1_price_mean"]), errors="coerce")
+    df["display_rating"] = pd.to_numeric(df["instr_rating"].where(df["instr_rating"].notna(), df["eval_overall"]), errors="coerce")
+    df["display_hours"] = pd.to_numeric(df["instr_hours"].where(df["instr_hours"].notna(), df["eval_hours"]), errors="coerce")
     df["_day"] = df["schedule"].apply(_parse_day_from_schedule)
     df["_time_slot"] = df["schedule"].apply(_parse_time_slot)
 
@@ -435,7 +435,8 @@ def build_section_data(course_list, features, bid_df, eval_df):
         row["schedule"] = " / ".join(schedules[:3])
         return row
 
-    cl = cl.groupby(["dept_code", "faculty", "quarter"], group_keys=False).apply(_agg_sections).reset_index(drop=True)
+    grouped = cl.groupby(["dept_code", "faculty", "quarter"], group_keys=False)
+    cl = pd.concat([_agg_sections(g) for _, g in grouped], axis=1).T.reset_index(drop=True)
 
     return cl
 
@@ -664,21 +665,21 @@ def page_explorer(features, bid_df, eval_df, section_data):
         if ai_results is not None and isinstance(ai_filters, dict):
             df = ai_results.copy()
             if "display_price" not in df.columns:
-                df["display_price"] = df["ci_p1_mean"].fillna(df["p1_price_mean"]) if "ci_p1_mean" in df.columns else df.get("p1_price_mean", 0)
+                df["display_price"] = pd.to_numeric(df["ci_p1_mean"].where(df["ci_p1_mean"].notna(), df["p1_price_mean"]), errors="coerce") if "ci_p1_mean" in df.columns else pd.to_numeric(df.get("p1_price_mean", 0), errors="coerce")
             if "display_rating" not in df.columns:
-                df["display_rating"] = df["instr_rating"].fillna(df["eval_overall"]) if "instr_rating" in df.columns else df.get("eval_overall", np.nan)
+                df["display_rating"] = pd.to_numeric(df["instr_rating"].where(df["instr_rating"].notna(), df["eval_overall"]), errors="coerce") if "instr_rating" in df.columns else pd.to_numeric(df.get("eval_overall", np.nan), errors="coerce")
             if "display_hours" not in df.columns:
-                df["display_hours"] = df["instr_hours"].fillna(df["eval_hours"]) if "instr_hours" in df.columns else df.get("eval_hours", np.nan)
+                df["display_hours"] = pd.to_numeric(df["instr_hours"].where(df["instr_hours"].notna(), df["eval_hours"]), errors="coerce") if "instr_hours" in df.columns else pd.to_numeric(df.get("eval_hours", np.nan), errors="coerce")
             if "display_recommend" not in df.columns:
-                df["display_recommend"] = df["instr_recommend"].fillna(df["eval_recommend"]) if "instr_recommend" in df.columns else df.get("eval_recommend", np.nan)
+                df["display_recommend"] = pd.to_numeric(df["instr_recommend"].where(df["instr_recommend"].notna(), df["eval_recommend"]), errors="coerce") if "instr_recommend" in df.columns else pd.to_numeric(df.get("eval_recommend", np.nan), errors="coerce")
         else:
             df = section_data.copy()
 
             # Use ci_p1_mean (course+instructor specific) as primary price
-            df["display_price"] = df["ci_p1_mean"].fillna(df["p1_price_mean"])
-            df["display_rating"] = df["instr_rating"].fillna(df["eval_overall"])
-            df["display_hours"] = df["instr_hours"].fillna(df["eval_hours"])
-            df["display_recommend"] = df["instr_recommend"].fillna(df["eval_recommend"])
+            df["display_price"] = pd.to_numeric(df["ci_p1_mean"].where(df["ci_p1_mean"].notna(), df["p1_price_mean"]), errors="coerce")
+            df["display_rating"] = pd.to_numeric(df["instr_rating"].where(df["instr_rating"].notna(), df["eval_overall"]), errors="coerce")
+            df["display_hours"] = pd.to_numeric(df["instr_hours"].where(df["instr_hours"].notna(), df["eval_hours"]), errors="coerce")
+            df["display_recommend"] = pd.to_numeric(df["instr_recommend"].where(df["instr_recommend"].notna(), df["eval_recommend"]), errors="coerce")
 
             # Parse schedule for filtering
             df["_day"] = df["schedule"].apply(_parse_day_from_schedule)
@@ -1067,7 +1068,7 @@ combined with {len(eval_df):,} course evaluation records.
         # Build instructor-level ranking from section_data
         # Aggregate across quarters: same dept_code + faculty = one entry
         top_sections = section_data.copy()
-        top_sections["display_p1"] = top_sections["ci_p1_mean"].fillna(top_sections["p1_price_mean"])
+        top_sections["display_p1"] = pd.to_numeric(top_sections["ci_p1_mean"].where(top_sections["ci_p1_mean"].notna(), top_sections["p1_price_mean"]), errors="coerce")
         top_sections = top_sections.dropna(subset=["display_p1"])
         top_sections = top_sections[top_sections["display_p1"] > 0]
         # Group by dept_code + faculty to merge quarters

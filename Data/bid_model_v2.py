@@ -174,7 +174,8 @@ def predict_two_stage(clf, reg, feature_cols, course_features):
 
     # Uncertainty from RF trees
     if hasattr(reg, "estimators_"):
-        tree_preds = np.array([np.expm1(tree.predict(X)[0]) for tree in reg.estimators_])
+        X_vals = X.values
+        tree_preds = np.array([np.expm1(tree.predict(X_vals)[0]) for tree in reg.estimators_])
         std = np.std(tree_preds)
         percentile_25 = np.percentile(tree_preds, 25)
         percentile_75 = np.percentile(tree_preds, 75)
